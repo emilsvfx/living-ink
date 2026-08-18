@@ -2,7 +2,7 @@
 
 A single-file, browser-based generative art toy. Draw ink strokes that seed a Physarum-style ("slime mold") particle simulation — three competing species chase and flee each other across the canvas, decaying and diffusing into evolving trails that never fully settle.
 
-No build step, no dependencies beyond Three.js (loaded from CDN for the 3D view). Open `living-ink.html` in a browser.
+No build step, no dependencies beyond Three.js (loaded from CDN for the 3D view). Open `index.html` in a browser, or try it live: https://emilsvfx.github.io/living-ink/
 
 ## Features
 
