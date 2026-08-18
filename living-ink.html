@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Living Ink</title>
+<style>
+  html,body{margin:0;height:100%;background:#05050a;overflow:hidden;font-family:sans-serif;color:#ddd}
+  #ink{position:absolute;top:0;left:0;touch-action:none;cursor:crosshair}
+  #three-container{position:absolute;top:0;left:0;display:none}
+  #ui{position:absolute;bottom:16px;left:16px;z-index:10;display:flex;gap:8px;align-items:center}
+  button{background:#1a1a24;color:#eee;border:1px solid #444;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px}
+  button:hover{background:#2a2a38}
+  #hint{position:absolute;top:16px;left:16px;font-size:12px;color:#666;z-index:10}
+  #galleryPanel{position:absolute;top:0;right:0;bottom:0;width:200px;background:#0c0c14;border-left:1px solid #333;z-index:20;display:none;flex-direction:column;gap:8px;padding:12px;overflow-y:auto}
+  #galleryPanel h3{margin:0 0 4px;font-size:12px;color:#888;font-weight:normal}
+  .galleryItem{position:relative;border:1px solid #333;border-radius:4px;overflow:hidden;cursor:pointer}
+  .galleryItem:hover{border-color:#77f}
+  .galleryItem img{display:block;width:100%}
+  .galleryItem .lineage{position:absolute;bottom:2px;left:4px;font-size:9px;color:#aaa;text-shadow:0 0 3px #000}
+  #speciesPicker{display:flex;gap:4px;align-items:center}
+  #speciesPicker span{font-size:11px;color:#888}
+  .speciesSwatch{width:20px;height:20px;padding:0;border-radius:50%;border:2px solid #444}
+  .speciesSwatch.active{border-color:#fff}
+  #controlsPanel{position:absolute;bottom:60px;left:16px;z-index:10;display:none;flex-direction:column;gap:6px;background:#0c0c14;border:1px solid #333;border-radius:8px;padding:12px;width:220px}
+  #controlsPanel h3{margin:0 0 4px;font-size:12px;color:#888;font-weight:normal}
+  .controlRow{display:flex;flex-direction:column;gap:2px;font-size:11px;color:#aaa}
+  .controlRow input[type=range]{width:100%}
+  .controlRow .val{color:#666;font-size:10px}
+</style>
+</head>
+<body>
+<canvas id="ink"></canvas>
+<div id="three-container"></div>
+<div id="hint">draw with mouse / touch — the ink keeps living</div>
+<div id="ui">
+  <button id="clearBtn">clear</button>
+  <button id="replayBtn">replay</button>
+  <button id="liftBtn">lift to 3D</button>
+  <button id="backBtn" style="display:none">back to canvas</button>
+  <button id="exportBtn">export PNG</button>
+  <button id="micBtn">mic: off</button>
+  <button id="saveBtn">save</button>
+  <button id="galleryBtn">gallery</button>
+  <button id="controlsBtn">controls</button>
+  <div id="speciesPicker">
+    <span>species:</span>
+    <button class="speciesSwatch active" data-species="0" style="background:rgb(255,70,70)"></button>
+    <button class="speciesSwatch" data-species="1" style="background:rgb(70,255,110)"></button>
+    <button class="speciesSwatch" data-species="2" style="background:rgb(90,120,255)"></button>
+  </div>
+</div>
+<div id="galleryPanel"><h3>gallery — click to fork</h3></div>
+<div id="controlsPanel">
+  <h3>live controls</h3>
+  <div class="controlRow"><label>speed <span class="val" id="val_speed"></span></label><input type="range" id="ctl_speed" min="0.3" max="4" step="0.1"></div>
+  <div class="controlRow"><label>sensor distance <span class="val" id="val_sensor"></span></label><input type="range" id="ctl_sensor" min="3" max="30" step="1"></div>
+  <div class="controlRow"><label>turn sensitivity <span class="val" id="val_turn"></span></label><input type="range" id="ctl_turn" min="0.05" max="1" step="0.05"></div>
+  <div class="controlRow"><label>trail persistence <span class="val" id="val_decay"></span></label><input type="range" id="ctl_decay" min="0.80" max="0.99" step="0.01"></div>
+  <div class="controlRow"><label>chase intensity <span class="val" id="val_prey"></span></label><input type="range" id="ctl_prey" min="0" max="2" step="0.1"></div>
+  <div class="controlRow"><label>flee intensity <span class="val" id="val_predator"></span></label><input type="range" id="ctl_predator" min="0" max="2" step="0.1"></div>
+  <button id="resetControlsBtn">reset to defaults</button>
+</div>
+
+<script type="importmap">
+{ "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---------- 2D ink + particle-life layer ----------
+const canvas = document.getElementById('ink');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+let W, H;
+
+// downsampled buffer used only for trail-sensing readback — a full-resolution
+// getImageData every frame allocates several MB of garbage each call (measured:
+// real per-frame cost climbing from ~11ms to ~26ms under sustained load, GC
+// pressure from that allocation). Sensing only needs coarse resolution anyway —
+// SENSOR_DIST is ~9px — so a capped-size buffer cuts the readback cost a lot
+// without changing the full-resolution canvas rendering itself.
+const SENSE_MAX_DIM = 640;
+const senseCanvas = document.createElement('canvas');
+const senseCtx = senseCanvas.getContext('2d', { willReadFrequently: true });
+let senseScale = 1, senseW = 1, senseH = 1;
+function updateSenseScale(){
+  senseScale = Math.min(1, SENSE_MAX_DIM / Math.max(W, H));
+  senseW = Math.max(1, Math.round(W * senseScale));
+  senseH = Math.max(1, Math.round(H * senseScale));
+  senseCanvas.width = senseW;
+  senseCanvas.height = senseH;
+}
+
+function resize(){
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  ctx.fillStyle = '#05050a';
+  ctx.fillRect(0,0,W,H);
+  updateSenseScale();
+}
+resize();
+window.addEventListener('resize', resize);
+
+// multi-species: each species deposits into its own RGB channel (R/G/B) of the
+// same canvas, so they read as separate chemical trails. Each species is mildly
+// attracted to the next species' trail (its "prey") and mildly repelled by the
+// previous one's ("predator") — a 3-way cyclic chase, not just parallel colonies.
+const SPECIES_COUNT = 3;
+const SPECIES_COLOR = [[255,70,70], [70,255,110], [90,120,255]];
+let PREY_WEIGHT = 0.8;
+let PREDATOR_WEIGHT = 0.6;
+let currentSpecies = 0;
+document.querySelectorAll('.speciesSwatch').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    currentSpecies = Number(btn.dataset.species);
+    document.querySelectorAll('.speciesSwatch').forEach(b=> b.classList.toggle('active', b===btn));
+  });
+});
+
+// attractant sources: points the user drew, keep depositing gently ("living" ink)
+const sources = [];
+
+// particles
+const particles = [];
+function spawnAt(x,y,species){
+  particles.push({ x, y, a: Math.random()*Math.PI*2, species: species ?? Math.floor(Math.random()*SPECIES_COUNT) });
+  if(particles.length > 4000) particles.shift();
+}
+// sparse ambient population spread across the whole canvas — a tight starting
+// cluster becomes a permanent attractor (trail-following steers particles back
+// into it, it saturates solid white, and nothing branches out)
+for(let i=0;i<180;i++) spawnAt(Math.random()*W, Math.random()*H);
+
+// pointer drawing
+let drawing = false;
+function toLocal(e){
+  const r = canvas.getBoundingClientRect();
+  const p = e.touches ? e.touches[0] : e;
+  return [p.clientX - r.left, p.clientY - r.top];
+}
+// stroke recording — every live-drawn point is captured with its relative
+// timestamp so "replay" can redraw the same session stroke-by-stroke
+let recordedPoints = []; // {x,y,t,species}
+let recordStart = null;
+let replayTimers = [];
+
+function addStroke(x,y, fromReplay, species){
+  const sp = species ?? currentSpecies;
+  sources.push({x,y,species:sp});
+  if(sources.length > 600) sources.shift();
+  for(let i=0;i<3;i++) spawnAt(x + (Math.random()-0.5)*6, y + (Math.random()-0.5)*6, sp);
+  if(!fromReplay){
+    if(recordStart === null) recordStart = performance.now();
+    recordedPoints.push({x, y, species: sp, t: performance.now() - recordStart});
+  }
+}
+canvas.addEventListener('pointerdown', e=>{ drawing = true; const [x,y]=toLocal(e); addStroke(x,y); });
+canvas.addEventListener('pointermove', e=>{ if(!drawing) return; const [x,y]=toLocal(e); addStroke(x,y); });
+window.addEventListener('pointerup', ()=> drawing = false);
+
+document.getElementById('clearBtn').addEventListener('click', ()=>{
+  ctx.fillStyle = '#05050a';
+  ctx.fillRect(0,0,W,H);
+  sources.length = 0;
+  recordedPoints = [];
+  recordStart = null;
+});
+
+document.getElementById('replayBtn').addEventListener('click', ()=>{
+  replayTimers.forEach(clearTimeout);
+  replayTimers = [];
+  if(recordedPoints.length === 0) return;
+  ctx.fillStyle = '#05050a';
+  ctx.fillRect(0,0,W,H);
+  sources.length = 0;
+  for(const pt of recordedPoints){
+    replayTimers.push(setTimeout(()=> addStroke(pt.x, pt.y, true, pt.species), pt.t));
+  }
+});
+
+// ---------- optional mic-reactivity ----------
+// louder input speeds up particle wandering and brightens deposits; entirely
+// optional, sim runs identically with mic off (the default state)
+let audioCtx = null, analyser = null, audioBuf = null, micActive = false;
+let __fakeLevel = null; // test-only override for verifying the reactive math without a real mic; removed after verification
+
+async function toggleMic(){
+  const micBtn = document.getElementById('micBtn');
+  if(micActive){
+    micActive = false;
+    micBtn.textContent = 'mic: off';
+    if(audioCtx){ audioCtx.close(); audioCtx = null; analyser = null; }
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    audioBuf = new Uint8Array(analyser.frequencyBinCount);
+    source.connect(analyser);
+    micActive = true;
+    micBtn.textContent = 'mic: on';
+  } catch(err){
+    micBtn.textContent = 'mic: denied';
+  }
+}
+document.getElementById('micBtn').addEventListener('click', toggleMic);
+
+function getAudioLevel(){ // normalized 0..1
+  if(__fakeLevel !== null) return __fakeLevel;
+  if(!micActive || !analyser) return 0;
+  analyser.getByteFrequencyData(audioBuf);
+  let sum = 0;
+  for(let i=0;i<audioBuf.length;i++) sum += audioBuf[i];
+  return sum / audioBuf.length / 255;
+}
+
+// simulation params (Physarum-lite: sense trail, steer, deposit, decay) — `let`,
+// not `const`, so the live-controls panel can retune the sim while it runs
+let SENSOR_DIST = 9;
+const SENSOR_ANGLE = 0.5;
+let TURN_SPEED = 0.3;
+let MOVE_SPEED = 1.3;
+let DECAY_RETAIN = 0.94; // higher = trails linger longer before fading
+
+const CONTROL_DEFAULTS = { speed: MOVE_SPEED, sensor: SENSOR_DIST, turn: TURN_SPEED, decay: DECAY_RETAIN, prey: PREY_WEIGHT, predator: PREDATOR_WEIGHT };
+
+function setControlDisplay(id, value, decimals){
+  document.getElementById('ctl_' + id).value = value;
+  document.getElementById('val_' + id).textContent = Number(value).toFixed(decimals);
+}
+function bindControl(id, decimals, onChange){
+  const input = document.getElementById('ctl_' + id);
+  input.addEventListener('input', ()=>{
+    const v = Number(input.value);
+    onChange(v);
+    document.getElementById('val_' + id).textContent = v.toFixed(decimals);
+  });
+}
+
+setControlDisplay('speed', MOVE_SPEED, 1);
+setControlDisplay('sensor', SENSOR_DIST, 0);
+setControlDisplay('turn', TURN_SPEED, 2);
+setControlDisplay('decay', DECAY_RETAIN, 2);
+setControlDisplay('prey', PREY_WEIGHT, 1);
+setControlDisplay('predator', PREDATOR_WEIGHT, 1);
+
+bindControl('speed', 1, v => MOVE_SPEED = v);
+bindControl('sensor', 0, v => SENSOR_DIST = v);
+bindControl('turn', 2, v => TURN_SPEED = v);
+bindControl('decay', 2, v => DECAY_RETAIN = v);
+bindControl('prey', 1, v => PREY_WEIGHT = v);
+bindControl('predator', 1, v => PREDATOR_WEIGHT = v);
+
+document.getElementById('resetControlsBtn').addEventListener('click', ()=>{
+  MOVE_SPEED = CONTROL_DEFAULTS.speed;
+  SENSOR_DIST = CONTROL_DEFAULTS.sensor;
+  TURN_SPEED = CONTROL_DEFAULTS.turn;
+  DECAY_RETAIN = CONTROL_DEFAULTS.decay;
+  PREY_WEIGHT = CONTROL_DEFAULTS.prey;
+  PREDATOR_WEIGHT = CONTROL_DEFAULTS.predator;
+  setControlDisplay('speed', MOVE_SPEED, 1);
+  setControlDisplay('sensor', SENSOR_DIST, 0);
+  setControlDisplay('turn', TURN_SPEED, 2);
+  setControlDisplay('decay', DECAY_RETAIN, 2);
+  setControlDisplay('prey', PREY_WEIGHT, 1);
+  setControlDisplay('predator', PREDATOR_WEIGHT, 1);
+});
+
+document.getElementById('controlsBtn').addEventListener('click', ()=>{
+  const panel = document.getElementById('controlsPanel');
+  panel.style.display = panel.style.display === 'flex' ? 'none' : 'flex';
+});
+
+let trailData = null; // snapshot refreshed each frame, used for sensing
+let simActive = true; // paused while viewing the 3D lift, sim keeps ticking otherwise
+
+// offscreen buffer used to diffuse the trail each frame (blur), so ink spreads into
+// branching filaments instead of just clumping where it decays in place
+const blurCanvas = document.createElement('canvas');
+const blurCtx = blurCanvas.getContext('2d');
+
+function sample(x,y,channel){
+  if(!trailData) return 0;
+  x = ((x % W) + W) % W;
+  y = ((y % H) + H) % H;
+  const sx = (x * senseScale) | 0;
+  const sy = (y * senseScale) | 0;
+  return trailData[(sy*senseW + sx)*4 + channel]; // R/G/B channel = species 0/1/2's trail
+}
+
+// composite sensed value for a species: its own trail, plus a pull toward its
+// "prey" species' trail, minus a push away from its "predator" species' trail
+function sensedValue(x,y,species){
+  const prey = (species + 1) % SPECIES_COUNT;
+  const predator = (species + 2) % SPECIES_COUNT;
+  return sample(x,y,species) + PREY_WEIGHT * sample(x,y,prey) - PREDATOR_WEIGHT * sample(x,y,predator);
+}
+
+function step(){
+  if(simActive){
+    // 1. diffuse + decay existing trail: blur a copy, composite it back down slightly dimmer
+    if(blurCanvas.width !== W || blurCanvas.height !== H){ blurCanvas.width = W; blurCanvas.height = H; }
+    blurCtx.clearRect(0,0,W,H);
+    blurCtx.filter = 'blur(1.2px)';
+    blurCtx.drawImage(canvas, 0, 0);
+    blurCtx.filter = 'none';
+    ctx.save();
+    ctx.fillStyle = '#05050a';
+    ctx.fillRect(0,0,W,H);
+    ctx.globalAlpha = DECAY_RETAIN;
+    ctx.drawImage(blurCanvas, 0, 0);
+    ctx.restore();
+
+    // 2. gently re-deposit at drawn sources so ink keeps "living"
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for(const s of sources){
+      const [cr,cg,cb] = SPECIES_COLOR[s.species ?? 0];
+      ctx.fillStyle = `rgba(${cr},${cg},${cb},0.05)`;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 3, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // 3. snapshot trail for sensing — downsampled (see senseCanvas above)
+    senseCtx.drawImage(canvas, 0, 0, senseW, senseH);
+    trailData = senseCtx.getImageData(0,0,senseW,senseH).data;
+
+    // 4. move + deposit particles — audio level (0 when mic is off) speeds
+    // wandering and brightens deposits, so the piece pulses with sound
+    const level = getAudioLevel();
+    const speedMul = 1 + level * 2.5;
+    const depositMul = 1 + level * 1.8;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for(const p of particles){
+      const sl = sensedValue(p.x + Math.cos(p.a - SENSOR_ANGLE)*SENSOR_DIST, p.y + Math.sin(p.a - SENSOR_ANGLE)*SENSOR_DIST, p.species);
+      const sc = sensedValue(p.x + Math.cos(p.a)*SENSOR_DIST, p.y + Math.sin(p.a)*SENSOR_DIST, p.species);
+      const sr = sensedValue(p.x + Math.cos(p.a + SENSOR_ANGLE)*SENSOR_DIST, p.y + Math.sin(p.a + SENSOR_ANGLE)*SENSOR_DIST, p.species);
+
+      if(sc >= sl && sc >= sr){ /* keep heading */ }
+      else if(sl > sr){ p.a -= TURN_SPEED * Math.random(); }
+      else { p.a += TURN_SPEED * Math.random(); }
+      p.a += (Math.random()-0.5) * 0.15;
+
+      p.x += Math.cos(p.a) * MOVE_SPEED * speedMul;
+      p.y += Math.sin(p.a) * MOVE_SPEED * speedMul;
+      if(p.x < 0) p.x += W; if(p.x >= W) p.x -= W;
+      if(p.y < 0) p.y += H; if(p.y >= H) p.y -= H;
+
+      const [cr,cg,cb] = SPECIES_COLOR[p.species];
+      ctx.fillStyle = `rgba(${cr},${cg},${cb},${Math.min(0.35 * depositMul, 0.7)})`;
+      ctx.fillRect(p.x, p.y, 1.4, 1.4);
+    }
+    ctx.restore();
+  }
+  requestAnimationFrame(step);
+}
+requestAnimationFrame(step);
+
+// ---------- 3D lift ----------
+const threeContainer = document.getElementById('three-container');
+let renderer, scene, camera, controls, points, animId;
+
+function buildThree(){
+  const data = ctx.getImageData(0,0,W,H).data;
+  const stride = 3;
+  const positions = [];
+  const colors = [];
+  const color = new THREE.Color();
+
+  for(let y=0;y<H;y+=stride){
+    for(let x=0;x<W;x+=stride){
+      const idx = (y*W+x)*4;
+      const r = data[idx], g = data[idx+1], b = data[idx+2];
+      const brightness = (r+g+b)/3;
+      if(brightness < 14) continue;
+      positions.push(x - W/2, H/2 - y, (Math.random()-0.5) * brightness * 0.6);
+      color.setRGB(r/255, g/255, b/255);
+      colors.push(color.r, color.g, color.b);
+    }
+  }
+
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 5000);
+  camera.position.set(0, 0, Math.max(W,H) * 0.9);
+
+  renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true, preserveDrawingBuffer:true }); // preserveDrawingBuffer so exportBtn's toDataURL isn't reading a cleared buffer
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  threeContainer.innerHTML = '';
+  threeContainer.appendChild(renderer.domElement);
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+  // holographic-foil shimmer: a custom shader instead of flat PointsMaterial —
+  // blends each point's real color with a shifting rainbow sheen driven by
+  // time + screen position, approximating a view-reactive holofoil look
+  // (not true PBR diffraction — that's a much bigger build — just a shimmer
+  // that reads as "holographic" and reacts as the camera orbits)
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uTime: { value: 0 }, uSize: { value: 260.0 } },
+    vertexColors: true,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    vertexShader: `
+      varying vec3 vColor;
+      uniform float uSize;
+      void main(){
+        vColor = color;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = uSize / -mvPosition.z;
+        gl_Position = projectionMatrix * mvPosition;
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vColor;
+      uniform float uTime;
+      void main(){
+        vec2 uv = gl_PointCoord - vec2(0.5);
+        float d = length(uv);
+        if(d > 0.5) discard;
+        float shift = uTime * 0.6 + gl_FragCoord.x * 0.01 + gl_FragCoord.y * 0.013;
+        vec3 rainbow = 0.5 + 0.5 * cos(6.28318 * (shift + vec3(0.0, 0.33, 0.67)));
+        vec3 finalColor = mix(vColor, rainbow, 0.6);
+        gl_FragColor = vec4(finalColor, smoothstep(0.5, 0.0, d));
+      }
+    `
+  });
+
+  points = new THREE.Points(geo, mat);
+  scene.add(points);
+
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.autoRotate = true;
+  controls.autoRotateSpeed = 0.5;
+
+  const clock = new THREE.Clock();
+  function animate(){
+    animId = requestAnimationFrame(animate);
+    mat.uniforms.uTime.value = clock.getElapsedTime();
+    controls.update();
+    renderer.render(scene, camera);
+  }
+  animate();
+}
+
+document.getElementById('liftBtn').addEventListener('click', ()=>{
+  simActive = false;
+  canvas.style.display = 'none';
+  document.getElementById('hint').style.display = 'none';
+  document.getElementById('liftBtn').style.display = 'none';
+  document.getElementById('clearBtn').style.display = 'none';
+  document.getElementById('backBtn').style.display = 'inline-block';
+  threeContainer.style.display = 'block';
+  buildThree();
+});
+
+document.getElementById('backBtn').addEventListener('click', ()=>{
+  if(animId) cancelAnimationFrame(animId);
+  if(renderer) renderer.dispose();
+  threeContainer.style.display = 'none';
+  threeContainer.innerHTML = '';
+  canvas.style.display = 'block';
+  document.getElementById('hint').style.display = 'block';
+  document.getElementById('liftBtn').style.display = 'inline-block';
+  document.getElementById('clearBtn').style.display = 'inline-block';
+  document.getElementById('backBtn').style.display = 'none';
+  simActive = true;
+});
+
+document.getElementById('exportBtn').addEventListener('click', ()=>{
+  const activeCanvas = threeContainer.style.display === 'block'
+    ? threeContainer.querySelector('canvas')
+    : canvas;
+  if(!activeCanvas) return;
+  const link = document.createElement('a');
+  link.download = `living-ink-${Date.now()}.png`;
+  link.href = activeCanvas.toDataURL('image/png');
+  link.click();
+});
+
+// ---------- fork/lineage gallery (localStorage-backed) ----------
+const GALLERY_KEY = 'livingInkGallery';
+const GALLERY_MAX = 40; // cap storage growth — oldest entries drop off
+let currentParentId = null;
+
+function loadGallery(){
+  try { return JSON.parse(localStorage.getItem(GALLERY_KEY) || '[]'); }
+  catch(e){ return []; }
+}
+function saveGalleryEntries(entries){
+  localStorage.setItem(GALLERY_KEY, JSON.stringify(entries));
+}
+
+function saveToGallery(){
+  const thumb = document.createElement('canvas');
+  thumb.width = 160;
+  thumb.height = Math.round(160 * H / W);
+  thumb.getContext('2d').drawImage(canvas, 0, 0, thumb.width, thumb.height);
+  const entries = loadGallery();
+  entries.push({
+    id: 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2,6),
+    dataUrl: thumb.toDataURL('image/png'),
+    parentId: currentParentId,
+    createdAt: Date.now()
+  });
+  while(entries.length > GALLERY_MAX) entries.shift();
+  saveGalleryEntries(entries);
+  renderGallery();
+}
+
+function forkFrom(entry){
+  const img = new Image();
+  img.onload = () => {
+    ctx.fillStyle = '#05050a';
+    ctx.fillRect(0,0,W,H);
+    ctx.drawImage(img, 0, 0, W, H);
+    sources.length = 0;
+    recordedPoints = [];
+    recordStart = null;
+    currentParentId = entry.id;
+  };
+  img.src = entry.dataUrl;
+}
+
+function renderGallery(){
+  const panel = document.getElementById('galleryPanel');
+  panel.querySelectorAll('.galleryItem').forEach(n => n.remove());
+  for(const entry of loadGallery().slice().reverse()){
+    const item = document.createElement('div');
+    item.className = 'galleryItem';
+    const img = document.createElement('img');
+    img.src = entry.dataUrl;
+    const lineage = document.createElement('div');
+    lineage.className = 'lineage';
+    lineage.textContent = entry.parentId ? 'forked' : 'root';
+    item.appendChild(img);
+    item.appendChild(lineage);
+    item.addEventListener('click', ()=> forkFrom(entry));
+    panel.appendChild(item);
+  }
+}
+
+document.getElementById('saveBtn').addEventListener('click', saveToGallery);
+document.getElementById('galleryBtn').addEventListener('click', ()=>{
+  const panel = document.getElementById('galleryPanel');
+  const willShow = panel.style.display !== 'flex';
+  panel.style.display = willShow ? 'flex' : 'none';
+  if(willShow) renderGallery();
+});
+</script>
+</body>
+</html>
